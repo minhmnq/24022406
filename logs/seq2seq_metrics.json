@@ -1,0 +1,60 @@
+{
+  "train_loss": [
+    6.1211295751424935,
+    5.549181512685922,
+    4.86765351662269,
+    4.3247069102067215,
+    3.9371444601279038,
+    3.646155755336468,
+    3.4193616280188928,
+    3.2305902737837573,
+    3.072957694530487,
+    2.937363708936251,
+    2.8194384107222925,
+    2.71726075227444
+  ],
+  "val_loss": [
+    5.793962160746257,
+    5.189212242762248,
+    4.616292715072632,
+    4.212419509887695,
+    3.958862523237864,
+    3.7927530805269876,
+    3.6640705664952598,
+    3.5767090717951455,
+    3.511820157368978,
+    3.463937819004059,
+    3.4216070969899497,
+    3.3803480664889016
+  ],
+  "bleu_score": [],
+  "final_bleu": 12.830078529776982,
+  "elapsed_seconds": 480.6788954734802,
+  "sample_translations": [
+    {
+      "src": "When I was little , I thought my country was the best on the planet , and I grew up singing a song called &quot; Nothing To Envy . &quot;",
+      "ref": "Khi tôi còn nhỏ , Tôi nghĩ rằng BắcTriều Tiên là đất nước tốt nhất trên thế giới và tôi thường hát bài &quot; Chúng ta chẳng có gì phải ghen tị . &quot;",
+      "pred": "khi tôi từng nhỏ , tôi nghĩ là nước tôi là nước tốt nhất trên hành tinh , và tôi lớn lên một bài hát &quot gọi là &quot không có gì để được được . &quot"
+    },
+    {
+      "src": "And I was very proud .",
+      "ref": "Tôi đã rất tự hào về đất nước tôi .",
+      "pred": "và tôi rất tự hào ."
+    },
+    {
+      "src": "In school , we spent a lot of time studying the history of Kim Il-Sung , but we never learned much about the outside world , except that America , South Korea , Japan are the enemies .",
+      "ref": "Ở trường , chúng tôi dành rất nhiều thời gian để học về cuộc đời của chủ tịch Kim II- Sung , nhưng lại không học nhiều về thế giới bên ngoài , ngoại trừ việc Hoa Kỳ , Hàn Quốc và Nhật Bản là kẻ thù của chúng tôi .",
+      "pred": "trong trường học , chúng tôi đã dành rất nhiều thời gian cho đến lịch sử từ lịch sử <unk> <unk> , nhưng chúng ta chưa từng nhận ra nhiều thế giới , ngoại lệ , hoa kỳ , nhật bản là một nhà hát ."
+    },
+    {
+      "src": "Although I often wondered about the outside world , I thought I would spend my entire life in North Korea , until everything suddenly changed .",
+      "ref": "Mặc dù tôi đã từng tự hỏi không biết thế giới bên ngoài kia như thế nào , nhưng tôi vẫn nghĩ rằng mình sẽ sống cả cuộc đời ở BắcTriều Tiên , cho tới khi tất cả mọi thứ đột nhiên thay đổi .",
+      "pred": "mặc dù tôi thường biết về sự biết về thế giới bên ngoài , tôi nghĩ tôi sẽ dành toàn cuộc sống của tôi ở bắc bắc , cho đến khi mọi thứ thay đổi ."
+    },
+    {
+      "src": "When I was seven years old , I saw my first public execution , but I thought my life in North Korea was normal .",
+      "ref": "Khi tôi lên 7 , tôi chứng kiến cảnh người ta xử bắn công khai lần đầu tiên trong đời , nhưng tôi vẫn nghĩ cuộc sống của mình ở đây là hoàn toàn bình thường .",
+      "pred": "khi tôi bảy tuổi , tôi thấy một công cụ của tôi , nhưng tôi nghĩ rằng tôi nghĩ cuộc đời tôi ở bắc bắc bắc bắc đã bình thường ."
+    }
+  ]
+}
