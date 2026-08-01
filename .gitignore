@@ -1,0 +1,4 @@
+models/*.pt
+!models/*.pt.part*
+__pycache__/
+*.pyc

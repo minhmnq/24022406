@@ -8,6 +8,7 @@ import copy
 import json
 import time
 import re
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,6 +19,12 @@ from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 # Set seed for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
+random.seed(42)
+
+# Enable fast GPU math paths: cuDNN autotuner + TF32 matmuls.
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # --- 1. Tokenizer & Vocabulary ---
 class SimpleVocab:
@@ -99,6 +106,39 @@ def pad_collate_fn(batch, src_pad_idx, trg_pad_idx):
     
     return torch.tensor(padded_src, dtype=torch.long), torch.tensor(padded_trg, dtype=torch.long)
 
+class LengthGroupedBatchSampler(torch.utils.data.Sampler):
+    """Groups examples of similar length into the same batch.
+
+    Sorting by length before batching drastically cuts the amount of padding,
+    so each batch has fewer wasted tokens and the epoch runs much faster
+    without changing the model. Batch order is reshuffled every epoch to keep
+    training stochastic.
+    """
+    def __init__(self, lengths, batch_size, shuffle=True):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = list(range(len(self.lengths)))
+        if self.shuffle:
+            random.shuffle(indices)
+        # Sort within large pools so batches share similar lengths but still vary.
+        pool_size = self.batch_size * 50
+        batches = []
+        for i in range(0, len(indices), pool_size):
+            pool = indices[i:i + pool_size]
+            pool.sort(key=lambda idx: self.lengths[idx])
+            for j in range(0, len(pool), self.batch_size):
+                batches.append(pool[j:j + self.batch_size])
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
 # --- 3. Transformer Model Architecture (from demo_transformer.ipynb) ---
 class Embedder(nn.Module):
     def __init__(self, vocab_size, d_model):
@@ -148,6 +188,7 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.d_k = d_model // heads
         self.h = heads
+        self.dropout_p = dropout
         self.q_linear = nn.Linear(d_model, d_model)
         self.k_linear = nn.Linear(d_model, d_model)
         self.v_linear = nn.Linear(d_model, d_model)
@@ -159,8 +200,15 @@ class MultiHeadAttention(nn.Module):
         q = self.q_linear(q).view(bs, -1, self.h, self.d_k).transpose(1, 2)
         k = self.k_linear(k).view(bs, -1, self.h, self.d_k).transpose(1, 2)
         v = self.v_linear(v).view(bs, -1, self.h, self.d_k).transpose(1, 2)
-        scores, _ = attention(q, k, v, mask, self.dropout)
-        concat = scores.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        # Use PyTorch's fused scaled-dot-product attention (Flash / mem-efficient
+        # kernels). It is far faster and lighter than the manual softmax path.
+        attn_mask = mask.unsqueeze(1).bool() if mask is not None else None
+        concat = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
+        concat = concat.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         return self.out(concat)
 
 class Norm(nn.Module):
@@ -463,8 +511,26 @@ def main():
     trg_pad_idx = trg_vocab.stoi[trg_vocab.pad_token]
 
     batch_size = 128
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
+    # Bucket by length to minimise padding -> big speedup, same model.
+    train_lengths = [len(s) + len(t) for s, t in train_ds.data]
+    train_sampler = LengthGroupedBatchSampler(train_lengths, batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx),
+        num_workers=2,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx),
+        num_workers=2,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=True,
+    )
 
     # Model Hyperparameters
     d_model = 512
@@ -487,9 +553,14 @@ def main():
 
     # Mixed precision speeds training on the RTX 3060 and lets us fit more data.
     use_amp = device.type == 'cuda'
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # bf16 (if supported) avoids gradient-scaling overhead and is more stable.
+    use_bf16 = use_amp and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and not use_bf16)
 
     epochs = 25
+    patience = 3  # Early-stop when val loss has not improved for this many epochs.
+    epochs_no_improve = 0
     history = {'train_loss': [], 'val_loss': [], 'bleu_score': []}
     best_val_loss = float('inf')
     best_state = None
@@ -502,24 +573,29 @@ def main():
         total_train_loss = 0.0
 
         for src, trg in train_loader:
-            src, trg = src.to(device), trg.to(device)
+            src = src.to(device, non_blocking=True)
+            trg = trg.to(device, non_blocking=True)
             trg_input = trg[:, :-1]
             trg_y = trg[:, 1:]
 
             src_mask, trg_mask = create_masks(src, trg_input, src_pad_idx, trg_pad_idx, device)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                 preds = model(src, trg_input, src_mask, trg_mask)
                 loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer._optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # Advance the LR schedule then step the underlying optimizer via the scaler.
             optimizer._update_learning_rate()
-            scaler.step(optimizer._optimizer)
-            scaler.update()
+            if use_bf16:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer._optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer._optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer._optimizer)
+                scaler.update()
 
             total_train_loss += loss.item()
 
@@ -530,11 +606,12 @@ def main():
         total_val_loss = 0.0
         with torch.no_grad():
             for src, trg in val_loader:
-                src, trg = src.to(device), trg.to(device)
+                src = src.to(device, non_blocking=True)
+                trg = trg.to(device, non_blocking=True)
                 trg_input = trg[:, :-1]
                 trg_y = trg[:, 1:]
                 src_mask, trg_mask = create_masks(src, trg_input, src_pad_idx, trg_pad_idx, device)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                     preds = model(src, trg_input, src_mask, trg_mask)
                     loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
                 total_val_loss += loss.item()
@@ -549,8 +626,16 @@ def main():
             best_val_loss = avg_val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             marker = " *best*"
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         print(f"Epoch {epoch:02d}/{epochs:02d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{marker}", flush=True)
+
+        # Stop early once validation loss stops improving to save time.
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} (no val improvement for {patience} epochs).", flush=True)
+            break
 
     elapsed_time = time.time() - start_time
     print(f"Training completed in {elapsed_time:.2f} seconds.", flush=True)

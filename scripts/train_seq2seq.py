@@ -34,7 +34,7 @@ class LuongAttention(nn.Module):
         score = score / math.sqrt(decoder_hidden.size(-1)) # Scaled score
         
         if src_mask is not None:
-            score = score.masked_fill(src_mask == 0, -1e9)
+            score = score.masked_fill(src_mask == 0, -1e4)
             
         attn_weights = F.softmax(score, dim=-1) # [batch_size, src_seq_len]
         context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1) # [batch_size, hidden_dim]
@@ -107,45 +107,73 @@ class Seq2SeqAttention(nn.Module):
 
         return torch.cat(outputs, dim=1) # [batch_size, trg_seq_len, trg_vocab_size]
 
-# --- 3. Greedy Inference Function ---
-def translate_greedy_seq2seq(model, src_sentence, src_vocab, trg_vocab, device, max_len=80):
+# --- 3. Batched Greedy Inference Function for Fast Evaluation ---
+def batch_translate_greedy_seq2seq(model, src_sentences, src_vocab, trg_vocab, device, max_len=80, batch_size=128):
     model.eval()
-    src_ids = src_vocab.encode(src_sentence)
-    src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
-    src_mask = (src_tensor != src_vocab.stoi[src_vocab.pad_token])
+    all_preds = []
+    pad_idx = src_vocab.stoi[src_vocab.pad_token]
+    sos_idx = trg_vocab.stoi[trg_vocab.sos_token]
+    eos_idx = trg_vocab.stoi[trg_vocab.eos_token]
 
-    with torch.no_grad():
-        src_embedded = model.src_embed(src_tensor)
-        encoder_outputs, (enc_h, enc_c) = model.encoder_lstm(src_embedded)
+    for start_idx in range(0, len(src_sentences), batch_size):
+        batch_sentences = src_sentences[start_idx:start_idx + batch_size]
+        src_ids_list = [src_vocab.encode(s) for s in batch_sentences]
+        max_src_len = max(len(ids) for ids in src_ids_list)
 
-        batch_size = 1
-        dec_h = enc_h.view(model.num_layers, 2, batch_size, model.hidden_dim // 2)
-        dec_h = torch.cat([dec_h[:, 0, :, :], dec_h[:, 1, :, :]], dim=-1)
+        padded_src = [ids + [pad_idx] * (max_src_len - len(ids)) for ids in src_ids_list]
+        src_tensor = torch.tensor(padded_src, dtype=torch.long, device=device)
+        src_mask = (src_tensor != pad_idx)
+        cur_batch_size = src_tensor.size(0)
 
-        dec_c = enc_c.view(model.num_layers, 2, batch_size, model.hidden_dim // 2)
-        dec_c = torch.cat([dec_c[:, 0, :, :], dec_c[:, 1, :, :]], dim=-1)
+        with torch.no_grad():
+            src_embedded = model.src_embed(src_tensor)
+            encoder_outputs, (enc_h, enc_c) = model.encoder_lstm(src_embedded)
 
-        trg_ids = [trg_vocab.stoi[trg_vocab.sos_token]]
-        context = torch.zeros(batch_size, model.hidden_dim, device=device)
+            dec_h = enc_h.view(model.num_layers, 2, cur_batch_size, model.hidden_dim // 2)
+            dec_h = torch.cat([dec_h[:, 0, :, :], dec_h[:, 1, :, :]], dim=-1)
 
-        for _ in range(max_len):
-            last_id = torch.tensor([[trg_ids[-1]]], dtype=torch.long, device=device)
-            trg_token_embed = model.trg_embed(last_id).squeeze(1)
-            lstm_input = torch.cat([trg_token_embed, context], dim=-1).unsqueeze(1)
+            dec_c = enc_c.view(model.num_layers, 2, cur_batch_size, model.hidden_dim // 2)
+            dec_c = torch.cat([dec_c[:, 0, :, :], dec_c[:, 1, :, :]], dim=-1)
 
-            decoder_output, (dec_h, dec_c) = model.decoder_lstm(lstm_input, (dec_h, dec_c))
-            dec_hidden_t = decoder_output.squeeze(1)
+            trg_ids = torch.full((cur_batch_size, 1), sos_idx, dtype=torch.long, device=device)
+            context = torch.zeros(cur_batch_size, model.hidden_dim, device=device)
+            finished = torch.zeros(cur_batch_size, dtype=torch.bool, device=device)
+            decoded_tokens = [[] for _ in range(cur_batch_size)]
 
-            context, _ = model.attention(dec_hidden_t, encoder_outputs, src_mask=src_mask)
-            concat_h = torch.tanh(model.wc(torch.cat([dec_hidden_t, context], dim=-1)))
-            logits_t = model.out(concat_h)
+            for _ in range(max_len):
+                last_id = trg_ids[:, -1:]
+                trg_token_embed = model.trg_embed(last_id).squeeze(1)
+                lstm_input = torch.cat([trg_token_embed, context], dim=-1).unsqueeze(1)
 
-            next_word_id = logits_t.argmax(dim=-1).item()
-            if next_word_id == trg_vocab.stoi[trg_vocab.eos_token]:
-                break
-            trg_ids.append(next_word_id)
+                decoder_output, (dec_h, dec_c) = model.decoder_lstm(lstm_input, (dec_h, dec_c))
+                dec_hidden_t = decoder_output.squeeze(1)
 
-    return trg_vocab.decode(trg_ids)
+                context, _ = model.attention(dec_hidden_t, encoder_outputs, src_mask=src_mask)
+                concat_h = torch.tanh(model.wc(torch.cat([dec_hidden_t, context], dim=-1)))
+                logits_t = model.out(concat_h)
+
+                next_word_ids = logits_t.argmax(dim=-1)
+                is_eos = (next_word_ids == eos_idx)
+                finished = finished | is_eos
+
+                if finished.all():
+                    break
+
+                next_word_list = next_word_ids.cpu().tolist()
+                finished_list = finished.cpu().tolist()
+                for b in range(cur_batch_size):
+                    if not finished_list[b]:
+                        decoded_tokens[b].append(next_word_list[b])
+
+                trg_ids = torch.cat([trg_ids, next_word_ids.unsqueeze(1)], dim=1)
+
+            for b in range(cur_batch_size):
+                all_preds.append(trg_vocab.decode(decoded_tokens[b]))
+
+    return all_preds
+
+def translate_greedy_seq2seq(model, src_sentence, src_vocab, trg_vocab, device, max_len=80):
+    return batch_translate_greedy_seq2seq(model, [src_sentence], src_vocab, trg_vocab, device, max_len=max_len, batch_size=1)[0]
 
 # --- 4. Main Training Script ---
 def main():
@@ -188,8 +216,9 @@ def main():
     trg_pad_idx = trg_vocab.stoi[trg_vocab.pad_token]
 
     batch_size = 128
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
+    pin_mem = (device.type == 'cuda')
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=pin_mem, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=pin_mem, collate_fn=lambda b: pad_collate_fn(b, src_pad_idx, trg_pad_idx))
 
     # Model Hyperparameters
     embed_dim = 512
@@ -202,11 +231,11 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params/1e6:.1f}M")
 
-    # Label smoothing improves generalisation for the RNN model too.
     criterion = nn.CrossEntropyLoss(ignore_index=trg_pad_idx, label_smoothing=0.1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # Halve the LR when validation loss plateaus.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
+
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     epochs = 20
     history = {'train_loss': [], 'val_loss': [], 'bleu_score': []}
@@ -221,18 +250,28 @@ def main():
         total_train_loss = 0.0
 
         for src, trg in train_loader:
-            src, trg = src.to(device), trg.to(device)
+            src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
             trg_input = trg[:, :-1]
             trg_y = trg[:, 1:]
 
             src_mask = (src != src_pad_idx)
-            preds = model(src, trg_input, src_mask=src_mask)
 
             optimizer.zero_grad()
-            loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    preds = model(src, trg_input, src_mask=src_mask)
+                    loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                preds = model(src, trg_input, src_mask=src_mask)
+                loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
             total_train_loss += loss.item()
 
@@ -243,12 +282,19 @@ def main():
         total_val_loss = 0.0
         with torch.no_grad():
             for src, trg in val_loader:
-                src, trg = src.to(device), trg.to(device)
+                src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
                 trg_input = trg[:, :-1]
                 trg_y = trg[:, 1:]
                 src_mask = (src != src_pad_idx)
-                preds = model(src, trg_input, src_mask=src_mask)
-                loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
+
+                if scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        preds = model(src, trg_input, src_mask=src_mask)
+                        loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
+                else:
+                    preds = model(src, trg_input, src_mask=src_mask)
+                    loss = criterion(preds.contiguous().view(-1, preds.size(-1)), trg_y.contiguous().view(-1))
+
                 total_val_loss += loss.item()
         avg_val_loss = total_val_loss / len(val_loader)
         scheduler.step(avg_val_loss)
@@ -270,20 +316,18 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Evaluate BLEU on the full tst2013 test set.
-    print("Evaluating BLEU score on the full tst2013 test set...")
-    hypotheses = []
-    references = []
+    # Evaluate BLEU on the full tst2013 test set using batched translation.
+    print("Evaluating BLEU score on the full tst2013 test set (batched)...")
     smooth = SmoothingFunction().method4
 
-    sample_translations = []
+    pred_sentences = batch_translate_greedy_seq2seq(model, test_en, src_vocab, trg_vocab, device, batch_size=128)
 
-    for i, (en_sent, vi_sent) in enumerate(zip(test_en, test_vi)):
-        pred_vi = translate_greedy_seq2seq(model, en_sent, src_vocab, trg_vocab, device)
-        hypotheses.append(trg_vocab.tokenize(pred_vi))
-        references.append([trg_vocab.tokenize(vi_sent)])
-        if i < 5:
-            sample_translations.append({'src': en_sent, 'ref': vi_sent, 'pred': pred_vi})
+    hypotheses = [trg_vocab.tokenize(pred) for pred in pred_sentences]
+    references = [[trg_vocab.tokenize(vi_sent)] for vi_sent in test_vi]
+
+    sample_translations = []
+    for i in range(min(5, len(test_en))):
+        sample_translations.append({'src': test_en[i], 'ref': test_vi[i], 'pred': pred_sentences[i]})
 
     bleu_score = corpus_bleu(references, hypotheses, smoothing_function=smooth) * 100
     print(f"Seq2Seq Attention BLEU Score on tst2013 (full): {bleu_score:.2f}")
